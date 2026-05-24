@@ -1,35 +1,69 @@
 # AWS Real-Time SIEM & Threat Detection Pipeline
 
-A serverless AWS pipeline that ingests CloudTrail-derived security events, detects high-risk activity, sends email alerts, and indexes confirmed detections in OpenSearch for investigation.
+An AWS-native, event-driven security pipeline that ingests CloudTrail-derived events via EventBridge, runs serverless detection logic, sends email alerts through SNS, and indexes confirmed detections in Amazon OpenSearch for investigation.
+
+> **Maturity:** This repository implements a focused detection MVP. It is **not** production-ready as-is. Several prerequisites (CloudTrail → EventBridge), bootstrap steps (OpenSearch index), and security hardening items are documented explicitly below.
 
 ---
 
 ## Overview
 
-This project implements a lightweight, event-driven SIEM pattern on AWS. Security-relevant API and console sign-in activity is routed through Amazon EventBridge to Python Lambda detectors. When a rule matches—or a threshold is exceeded—the pipeline publishes an SNS email alert and writes a structured document to an OpenSearch index.
+This project demonstrates how to build a lightweight SIEM-style detection pipeline entirely on managed AWS services. Security-relevant activity—failed console sign-ins, root account API usage, and S3 ACL/policy changes—is evaluated in near real time without operating long-lived servers.
 
-**Problem it addresses:** Cloud accounts generate large volumes of audit logs. Without near-real-time filtering and alerting, risky actions such as root account usage, repeated failed console logins, or S3 ACL/policy changes can go unnoticed until a later review.
+**Security problem:** Cloud audit logs are high-volume and easy to defer. High-impact events (root usage, credential stuffing against the console, risky S3 changes) need fast triage, not only periodic log review.
 
-**Why real-time matters:** In cloud environments, misconfigurations and credential abuse can escalate in minutes. EventBridge-to-Lambda processing reduces the gap between an API call in CloudTrail and analyst notification, which supports faster containment and investigation.
+**Why real-time matters:** Cloud compromise and misconfiguration timelines are measured in minutes. Routing CloudTrail events through EventBridge to Lambda reduces detection latency compared to batch log analysis, supporting faster investigation and containment.
 
-> **Scope note:** This is a focused detection MVP—not a full enterprise SIEM. CloudTrail trails, dashboards, automated remediation, and several security hardening items are documented under [Future Improvements](#future-improvements) where they are not yet in code.
+---
+
+## Why This Project Matters
+
+Cloud environments are API-driven and highly automated. A single misconfigured S3 policy or exposed root credentials can affect the entire account before a weekly log review occurs.
+
+Automated detection pipelines translate audit telemetry into **actionable signals**: structured alerts, indexed events, and repeatable infrastructure. AWS-native patterns (EventBridge, Lambda, DynamoDB, OpenSearch) show how security operations can align with modern cloud architecture—elastic, pay-per-use, and defined as code.
+
+This project is suitable as a portfolio piece for **cloud security**, **detection engineering**, and **infrastructure-as-code** practice: it connects threat models to concrete event patterns and implementation tradeoffs.
+
+---
+
+## Engineering Goals
+
+| Goal | How the project addresses it |
+|------|------------------------------|
+| **Serverless security architecture** | No EC2 or container fleet; compute is Lambda-only |
+| **Event-driven processing** | EventBridge rules invoke detectors on matching CloudTrail events |
+| **Detection engineering** | Three explicit rules with severities, thresholds, and documented limitations |
+| **Terraform / IaC** | Modular Terraform for SNS, Lambda, EventBridge, DynamoDB, OpenSearch |
+| **Observability (baseline)** | CloudWatch Logs via Lambda; SNS for human-visible alerts |
+| **AWS-native SIEM concepts** | Ingest → detect → alert → index, using account audit and search services |
+| **Security-focused design** | Encryption on OpenSearch, IAM SigV4 to OpenSearch, DynamoDB TTL for state |
 
 ---
 
 ## Key Features
 
-| Feature | Implementation |
-|--------|----------------|
-| **Event-driven ingestion** | Amazon EventBridge rules on CloudTrail event patterns |
-| **Threat detection** | Three Lambda detectors (failed console auth, root usage, S3 ACL/policy changes) |
-| **Threshold-based brute-force detection** | DynamoDB counter per source IP with TTL window |
-| **Email alerting** | Amazon SNS topic with email subscription |
-| **Event indexing** | Amazon OpenSearch (`siem-events` index) for alerts that fire |
-| **Infrastructure as Code** | Terraform modules for SNS, Lambda, EventBridge, DynamoDB, and OpenSearch |
-| **Encryption** | OpenSearch encryption at rest, node-to-node encryption, HTTPS enforced |
-| **Operational scripts** | Parent-repo helpers for OpenSearch index setup (`../setup_opensearch.py`) and connectivity checks (`../diag.py`) |
+- **EventBridge ingestion** — Three rules targeting CloudTrail event shapes (`aws.signin`, `aws.s3`, multi-service root activity)
+- **Lambda-based detections** — Python 3.12 functions: `siem-failed-auth-detector`, `siem-root-usage-detector`, `siem-s3-exposure-detector`
+- **SNS email alerting** — Topic `guardrail-siem-alerts` with email subscription
+- **OpenSearch indexing** — Documents written to `siem-events` via **IAM SigV4** (`botocore` signing)
+- **DynamoDB threshold tracking** — Table `siem-failed-auth` with per-IP counters and TTL
+- **Terraform deployment** — Root module + `sns`, `lambda`, `opensearch` child modules
+- **OpenSearch encryption** — At-rest, node-to-node, HTTPS/TLS 1.2+ enforced
+- **Fine-grained access control** — OpenSearch advanced security with internal master user (domain admin / bootstrap)
+- **CloudWatch logging** — Standard Lambda log groups (implicit; not customized in Terraform)
+- **Lambda timeout** — 30 seconds per function
 
-**Not implemented in this repository:** Kinesis/Firehose log streaming, Security Hub, GuardDuty integration, OpenSearch Dashboards as code, dead-letter queues, automated blocking/remediation, or multi-account/org-wide deployment.
+**Not implemented:** GuardDuty, Security Hub, Kinesis/Firehose, SOAR, dashboards as code, DLQs, multi-account aggregation, automated remediation, CI/CD, automated tests.
+
+---
+
+## Detection Coverage
+
+| Detection | Severity | Alerting | Indexed | Stateful |
+|-----------|----------|----------|---------|----------|
+| **Brute force (failed console auth)** | HIGH | Yes, when ≥ 5 failures in window | Yes, on alert only | Yes — DynamoDB per `source_ip` |
+| **Root account usage** | CRITICAL | Yes, every match | Yes, every alert | No |
+| **S3 ACL / policy change** | HIGH | Yes, every match | Yes, every alert | No |
 
 ---
 
@@ -37,98 +71,151 @@ This project implements a lightweight, event-driven SIEM pattern on AWS. Securit
 
 ![Architecture Diagram](docs/images/architecture-diagram.png)
 
-*Replace this placeholder with the final architecture diagram. Suggested components: CloudTrail → EventBridge → Lambda detectors → SNS + OpenSearch; DynamoDB for failed-auth state.*
+TODO: Replace with final architecture diagram.
 
 ---
 
 ## Architecture Explanation
 
-Terraform (`main.tf`) provisions three modules in **us-east-1**:
+### High-level flow
 
-| Component | AWS service | Role |
-|-----------|-------------|------|
-| **Ingestion** | EventBridge (CloudTrail events) | Routes matching events to the correct Lambda |
-| **Detection** | Lambda (Python 3.12) | Parses event `detail`, applies rule logic, decides alert vs. skip |
-| **State (brute force)** | DynamoDB (`siem-failed-auth`) | Tracks failed login counts per `source_ip` with TTL |
-| **Alerting** | SNS (`guardrail-siem-alerts`) | Email notifications to the configured address |
-| **Storage / search** | OpenSearch (`siem-events` domain) | Stores structured detection documents |
+```
+CloudTrail → (default) EventBridge bus → EventBridge rules → Lambda detectors
+                                                      ├→ SNS (email)
+                                                      ├→ DynamoDB (failed auth only)
+                                                      └→ OpenSearch (siem-events index)
+```
 
-### Module layout (Terraform)
+### AWS services and rationale
 
-- **`modules/sns`** — SNS topic and email subscription
-- **`modules/lambda`** — IAM role, three Lambda functions, EventBridge rules/targets/permissions, DynamoDB table
-- **`modules/opensearch`** — OpenSearch domain, domain access policy, encryption settings
+| Service | Role | Why it was chosen |
+|---------|------|-------------------|
+| **CloudTrail** | Source of truth for API / console events | Required for AWS API audit; EventBridge integration enables real-time routing |
+| **EventBridge** | Filter and route events | Decouples ingestion from detection; pattern matching without polling S3 log buckets |
+| **Lambda** | Detection runtime | Scales per event, minimal ops overhead, fits bursty security traffic |
+| **DynamoDB** | Brute-force counter + TTL | Low-latency keyed state (`source_ip`) without managing Redis/EC2 |
+| **SNS** | Alert notification | Simple email channel for MVP; no third-party integration required |
+| **OpenSearch Service** | Detection storage / search | Structured fields for investigation; familiar SIEM query UX |
+| **IAM** | Lambda execution + OpenSearch HTTP | SigV4 signing from Lambda role; domain policy grants `es:*` to role |
 
-**Prerequisite (manual):** CloudTrail must deliver events to EventBridge. This repository does **not** create a CloudTrail trail or enable the EventBridge integration—that must exist in the target AWS account before rules will receive events.
+### Terraform modules
 
-**Circular dependency:** The Lambda module needs the OpenSearch endpoint; the OpenSearch module needs the Lambda role ARN for its access policy. Terraform resolves this through cross-module references on apply.
+| Module | Provisions |
+|--------|------------|
+| `modules/sns` | SNS topic + email subscription |
+| `modules/lambda` | IAM role/policy, 3× Lambda, 3× EventBridge rules/targets/permissions, DynamoDB table |
+| `modules/opensearch` | OpenSearch domain `siem-events`, domain access policy |
+
+**Root wiring (`main.tf`):** `module.sns` → `module.opensearch` ↔ `module.lambda` (OpenSearch needs `lambda_role_arn`; Lambda needs `opensearch_endpoint`). Terraform resolves this circular reference on apply.
+
+### Tradeoffs
+
+- **Pros:** Low operational burden, fast path from event to alert, reproducible infra, pay-per-use components.
+- **Cons:** Per-rule Lambda (not a shared rules engine), no centralized correlation, OpenSearch is a fixed-cost anchor, detection logic is code-not-data (no Sigma/YAML rules).
+
+### Scalability (current)
+
+- Lambda and EventBridge scale with event volume in a single account.
+- OpenSearch is a **single** `t3.small.search` node—vertical scaling or cluster redesign needed at higher ingest rates.
+- Failed-auth state is **per source IP** only; high cardinality of IPs could increase DynamoDB item count (mitigated somewhat by TTL).
+
+---
+
+## Security Architecture Decisions
+
+| Decision | Rationale (as implemented) |
+|----------|----------------------------|
+| **Serverless detectors** | No persistent compute to patch; blast radius limited to function IAM and env vars |
+| **EventBridge decoupling** | Ingestion patterns can change without redeploying Lambda code (within pattern limits) |
+| **DynamoDB + TTL** | Brute-force state expires automatically (`WINDOW_SECONDS`); avoids indefinite IP tracking |
+| **Threshold before alert (failed auth)** | Reduces alert noise vs. alerting on every failed login |
+| **Immediate alert (root, S3)** | High-severity or high-risk changes warrant instant notification in this MVP |
+| **OpenSearch encryption** | Protects indexed detection data at rest and in transit |
+| **IAM SigV4 to OpenSearch** | Lambdas use execution role credentials (`SigV4Auth`) instead of static passwords in environment variables |
+| **Terraform-managed domain** | Reproducible encryption, HTTPS, and access policy baseline |
+| **Single shared Lambda role** | Simpler IAM for MVP; all detectors share `siem-lambda-exec-role` |
 
 ---
 
 ## Event Processing Flow
 
-1. **CloudTrail** records an API or console sign-in event in the AWS account.
-2. **EventBridge** evaluates one or more rules (`siem-failed-auth-detection`, `siem-root-account-usage`, `siem-s3-public-exposure`) and invokes the target Lambda when the pattern matches.
-3. **Lambda** reads `event.detail` (CloudTrail payload shape).
-4. **Rule logic** runs:
-   - *Failed auth:* skip unless `errorMessage` contains `Failed authentication`; increment DynamoDB counter; alert only if count ≥ threshold.
-   - *Root usage:* skip unless `userIdentity.type` is `Root`; alert immediately.
-   - *S3 exposure:* alert on every matching `PutBucketAcl` / `PutBucketPolicy` (no post-check that the bucket is actually public).
-5. **SNS** publishes an email (when an alert fires).
-6. **OpenSearch** receives a JSON document via HTTPS (`POST /siem-events/_doc`) using basic authentication from Lambda environment variables.
-7. **DynamoDB TTL** expires brute-force counter rows after the configured window.
+1. **Event generation** — An API call or console sign-in occurs; CloudTrail records it (trail must exist and, for EventBridge delivery, integration must be enabled).
+2. **EventBridge routing** — A rule (`siem-failed-auth-detection`, `siem-root-account-usage`, or `siem-s3-public-exposure`) matches the event pattern and invokes the target Lambda.
+3. **Lambda processing** — Handler parses `event["detail"]` (CloudTrail payload).
+4. **Detection logic** — Rule-specific filters (error message, `userIdentity.type`, `eventName`) and, for failed auth, DynamoDB counter vs. threshold.
+5. **Alerting** — On alert path, `sns.publish()` sends email to subscribed addresses.
+6. **Indexing** — On alert path (and threshold met for brute force), `POST https://{endpoint}/siem-events/_doc` with SigV4-signed request.
+7. **Investigation** — Analyst reviews SNS email and queries OpenSearch (`siem-events`) via Dashboards or REST API. **Dashboards are not provisioned in this repo.**
 
 ---
 
 ## Threat Detection Logic
 
-Detection logic lives in `lambda_functions/*/handler.py`. Rules are intentionally simple and should be tuned before any production use.
-
 ### 1. Brute force — failed console authentication
 
-| Attribute | Value |
-|-----------|--------|
+| Item | Detail |
+|------|--------|
 | **Lambda** | `siem-failed-auth-detector` |
-| **EventBridge** | `aws.signin` / `AWS Console Sign In via CloudTrail` |
-| **Detects** | Repeated failed AWS Management Console sign-in attempts from the same source IP |
-| **Threshold** | `5` failures (env `FAILURE_THRESHOLD`) |
-| **Window** | `600` seconds / 10 minutes (env `WINDOW_SECONDS`, DynamoDB TTL) |
-| **Severity** | `HIGH` (indexed document only when alert fires) |
-| **Alert subject** | `[SIEM ALERT] Brute Force Detected from {source_ip}` |
-
-Intermediate failures are recorded in DynamoDB only; SNS and OpenSearch are updated when the threshold is reached.
+| **EventBridge** | Source `aws.signin`, detail-type `AWS Console Sign In via CloudTrail` |
+| **Logic** | Skip unless `detail.errorMessage` contains `Failed authentication` |
+| **Threshold** | `5` failures (`FAILURE_THRESHOLD`) |
+| **Window** | `600` seconds (`WINDOW_SECONDS`); DynamoDB TTL on attribute `ttl` |
+| **Severity** | `HIGH` (in indexed document) |
+| **False positives** | Shared NAT IPs, security scanners, legitimate users mistyping passwords |
+| **Limitations** | Keyed by IP only (not username); no geo/block automation; sub-threshold events are not indexed |
 
 ### 2. Root account usage
 
-| Attribute | Value |
-|-----------|--------|
+| Item | Detail |
+|------|--------|
 | **Lambda** | `siem-root-usage-detector` |
-| **EventBridge** | Multiple sources (`aws.signin`, `aws.iam`, `aws.s3`, `aws.ec2`, `aws.cloudtrail`) with `userIdentity.type = Root` |
-| **Detects** | Any CloudTrail event where the principal is the root account |
-| **Threshold** | None — one event triggers an alert |
+| **EventBridge** | Sources include `aws.signin`, `aws.iam`, `aws.s3`, `aws.ec2`, `aws.cloudtrail`; `userIdentity.type` = `Root` |
+| **Logic** | Lambda double-checks `identity_type == "Root"` |
+| **Threshold** | None — one event → alert + index |
 | **Severity** | `CRITICAL` |
-| **Alert subject** | `[CRITICAL SIEM ALERT] Root Account Usage Detected` |
+| **False positives** | Rare if root is unused; break-glass root access triggers by design |
+| **Limitations** | Does not distinguish read vs. write; no approval workflow |
 
-### 3. S3 public exposure (policy / ACL change)
+### 3. S3 “public exposure” (ACL / policy change)
 
-| Attribute | Value |
-|-----------|--------|
+| Item | Detail |
+|------|--------|
 | **Lambda** | `siem-s3-exposure-detector` |
-| **EventBridge** | `aws.s3` / `AWS API Call via CloudTrail` for `PutBucketAcl`, `PutBucketPolicy` |
-| **Detects** | S3 bucket ACL or bucket policy modification events |
-| **Threshold** | None — each matching API call triggers an alert |
+| **EventBridge** | Source `aws.s3`, `eventName` ∈ `PutBucketAcl`, `PutBucketPolicy` |
+| **Logic** | Alerts on API name match only |
+| **Threshold** | None |
 | **Severity** | `HIGH` |
-| **Alert subject** | `[SIEM ALERT] S3 Public Exposure Detected` |
+| **False positives** | **High** — any policy/ACL update alerts; does not parse JSON for `Principal: "*"` or public ACL grants |
+| **Limitations** | Name is aspirational; verification of public access is **not implemented** |
 
-> **Honest limitation:** The handler does not parse the new ACL or policy to confirm public access. Any qualifying API call generates an alert. Reducing false positives would require additional logic (e.g., inspect `requestParameters` / policy JSON).
+### Indexed document shape
 
-### Indexed document schema (OpenSearch)
+```json
+{
+  "timestamp": "<ISO8601>",
+  "event_type": "BruteForce | RootAccountUsage | S3PublicExposure",
+  "severity": "HIGH | CRITICAL",
+  "source_ip": "<ip>",
+  "user": "<arn or identity>",
+  "details": { }
+}
+```
 
-Fields written by detectors:
+Index mapping is created manually via `../setup_opensearch.py` (parent repo), not Terraform.
 
-- `timestamp`, `event_type`, `severity`, `source_ip`, `user`, `details` (object)
+---
 
-The index mapping is defined in `../setup_opensearch.py` (parent directory), not in Terraform.
+## Scalability Considerations
+
+| Component | Current behavior | Future considerations |
+|-----------|------------------|----------------------|
+| **Lambda** | Concurrent executions scale with invocations; 30s timeout | Reserved concurrency per detector; provisioned concurrency if cold start matters |
+| **EventBridge** | Default bus limits apply; pattern volume per account | Organization-wide buses, cross-account forwarding |
+| **DynamoDB** | On-demand (`PAY_PER_REQUEST`), single partition key `source_ip` | Hot keys if one IP dominates; consider composite key (IP + user) |
+| **OpenSearch** | 1× `t3.small.search`, 10 GB gp3 | Multi-AZ, dedicated masters, UltraWarm/ILM for retention |
+| **SNS email** | Human-scale alert volume | SQS fan-out, ticketing webhooks, rate limiting |
+
+At very high CloudTrail volume, broad rules (e.g. all console sign-ins for failed-auth) can invoke Lambda frequently—cost and throttling should be monitored.
 
 ---
 
@@ -136,14 +223,13 @@ The index mapping is defined in `../setup_opensearch.py` (parent directory), not
 
 | Category | Technologies |
 |----------|----------------|
-| **Language** | Python 3.12 (Lambda handlers) |
-| **IaC** | Terraform (HashiCorp AWS provider ~6.45, archive provider ~2.8) |
-| **AWS services** | EventBridge, Lambda, SNS, DynamoDB, OpenSearch Service, IAM, CloudWatch Logs (via Lambda execution) |
-| **Libraries (Lambda)** | `boto3`, `urllib3` (OpenSearch HTTP) |
-| **Libraries (setup scripts)** | `boto3`, `requests`, `requests-aws4auth`, `certifi` (parent repo `venv`) |
-| **Tooling** | AWS CLI, Terraform ≥ 1.x |
-
-No Node.js, Docker, or container images are used for the pipeline itself.
+| **Languages** | Python 3.12 (Lambda) |
+| **AWS services** | CloudTrail (prerequisite), EventBridge, Lambda, SNS, DynamoDB, OpenSearch Service, IAM, CloudWatch Logs |
+| **IaC** | Terraform; providers: `hashicorp/aws` ~6.45, `hashicorp/archive` ~2.8 |
+| **Libraries (Lambda)** | `boto3`, `botocore` (SigV4), `urllib3` |
+| **Libraries (bootstrap scripts)** | `boto3`, `requests`, `requests-aws4auth`, `certifi` (parent `venv`) |
+| **Monitoring** | CloudWatch (Lambda default metrics/logs only) |
+| **Deployment** | Terraform CLI, AWS CLI |
 
 ---
 
@@ -151,102 +237,134 @@ No Node.js, Docker, or container images are used for the pipeline itself.
 
 ```
 cloud-siem-pipeline/
-├── main.tf                      # Root module: wires sns, lambda, opensearch
-├── variables.tf                 # Root input variables
-├── outputs.tf                   # OpenSearch endpoint/ARN, SNS topic ARN
-├── terraform.tfvars.example     # Example variable values (copy to terraform.tfvars)
+├── main.tf                      # Provider, module orchestration
+├── variables.tf                 # alert_email, OpenSearch master credentials
+├── outputs.tf                   # opensearch_endpoint, opensearch_arn, sns_topic_arn
+├── terraform.tfvars.example     # Example inputs (copy → terraform.tfvars)
 ├── README.md
-├── payload.json                 # Sample EventBridge payload (local testing; gitignored)
-├── response.json                # Lambda invoke output (gitignored)
+├── payload.json                 # Sample invoke payload (gitignored)
+├── response.json                # Invoke output (gitignored)
+├── docs/
+│   └── images/                  # Architecture diagram, screenshots (add locally)
 ├── lambda_functions/
-│   ├── failed_auth/handler.py   # Brute-force detector
-│   ├── root_usage/handler.py    # Root account detector
-│   └── s3_exposure/handler.py   # S3 ACL/policy change detector
+│   ├── failed_auth/handler.py
+│   ├── root_usage/handler.py
+│   └── s3_exposure/handler.py
 └── modules/
-    ├── lambda/                  # Lambdas, EventBridge, DynamoDB, IAM
-    ├── opensearch/              # OpenSearch domain and access policy
-    └── sns/                     # Alert topic and email subscription
+    ├── lambda/                  # Detectors, EventBridge, DynamoDB, IAM
+    ├── opensearch/              # Domain + access policy
+    └── sns/                     # Alert topic
 
-../setup_opensearch.py            # Post-deploy: index mapping, role mapping, test doc
-../diag.py                        # Connectivity / credential sanity check
+../setup_opensearch.py           # Post-deploy: index + FGAC role mapping (parent repo)
+../diag.py                       # Ad-hoc connectivity check (parent repo)
 ```
-
-Generated at build/apply time (gitignored): `*.zip` Lambda packages, `.terraform/`, `terraform.tfstate*`.
 
 ---
 
 ## Infrastructure as Code
 
+### Layout
+
+- **Single environment** — No `dev`/`prod` workspaces or separate state backends defined in repo.
+- **State** — Local `terraform.tfstate` (gitignored); **remote state not configured**.
+- **Region** — `us-east-1` hardcoded in provider and several ARNs.
+
 ### Root variables
 
-| Variable | Description | Sensitive |
-|----------|-------------|-----------|
-| `alert_email` | SNS email subscription endpoint | No |
-| `opensearch_master_user` | OpenSearch fine-grained access master user | No |
+| Variable | Purpose | Sensitive |
+|----------|---------|-----------|
+| `alert_email` | SNS email endpoint | No |
+| `opensearch_master_user` | OpenSearch fine-grained master user | No |
 | `opensearch_master_password` | OpenSearch master password | Yes |
 
 ### Root outputs
 
 | Output | Description |
 |--------|-------------|
-| `opensearch_endpoint` | HTTPS endpoint for the domain |
+| `opensearch_endpoint` | Domain hostname for HTTPS API |
 | `opensearch_arn` | Domain ARN |
-| `sns_topic_arn` | Topic for SIEM alerts |
+| `sns_topic_arn` | Alert topic ARN |
 
-### Major provisioned resources
+### Resources provisioned (summary)
 
-- **SNS:** `guardrail-siem-alerts` + email subscription
-- **Lambda:** `siem-failed-auth-detector`, `siem-root-usage-detector`, `siem-s3-exposure-detector`
-- **EventBridge:** Three rules with Lambda targets and invoke permissions
-- **DynamoDB:** `siem-failed-auth` (pay-per-request, hash key `source_ip`, TTL on `ttl`)
-- **IAM:** `siem-lambda-exec-role` with SNS publish, CloudWatch Logs, and DynamoDB access
-- **OpenSearch:** `siem-events` domain (single `t3.small.search`, 10 GB gp3 EBS)
+- SNS topic `guardrail-siem-alerts` + email subscription
+- IAM role `siem-lambda-exec-role` + inline policy (SNS, Logs, DynamoDB `siem-*`, OpenSearch HTTP)
+- 3× Lambda functions, 3× EventBridge rules, targets, invoke permissions
+- DynamoDB `siem-failed-auth` (TTL enabled)
+- OpenSearch domain `siem-events` (OpenSearch 2.11, `t3.small.search`)
 
-### Environments
+### Deployment flow
 
-There is a **single** Terraform configuration—no `dev`/`prod` workspace split or environment-specific `.tfvars` files beyond your local `terraform.tfvars`.
+```bash
+cd cloud-siem-pipeline
+cp terraform.tfvars.example terraform.tfvars
+# Edit terraform.tfvars (do not commit)
+
+terraform init
+terraform plan
+terraform apply
+```
+
+**Note:** `main.tf` passes `opensearch_user` / `opensearch_pass` into the Lambda module, but the module **does not use them** in resources (legacy variables). OpenSearch access from Lambda is via **IAM SigV4** only.
 
 ---
 
 ## Security Considerations
 
-### Implemented
+### Implemented Security Controls
 
-- **OpenSearch encryption:** at-rest and node-to-node encryption enabled; HTTPS enforced with TLS 1.2+ policy
-- **Fine-grained access control:** OpenSearch advanced security with internal master user
-- **Domain access policy:** Allows the Lambda execution role; includes IP-restricted and IAM-user statements (see gaps below)
-- **Audit trail dependency:** Detections rely on CloudTrail (account-level audit source)
-- **DynamoDB TTL:** Limits retention of brute-force counter state
-- **Secrets in Terraform:** `opensearch_master_password` marked `sensitive`; `terraform.tfvars` gitignored
+| Control | Implementation |
+|---------|----------------|
+| **IAM** | Dedicated Lambda execution role; OpenSearch HTTP actions scoped to `domain/siem-events/*` |
+| **OpenSearch signing** | Lambdas use `SigV4Auth` with execution role credentials |
+| **Encryption** | OpenSearch encrypt at rest + node-to-node; HTTPS enforced |
+| **TLS** | `Policy-Min-TLS-1-2-2019-07` on domain endpoint |
+| **Access policy** | Domain policy allows Lambda role; additional principals in policy (see gaps) |
+| **Audit dependency** | Detections require CloudTrail |
+| **TTL cleanup** | DynamoDB TTL on brute-force tracking rows |
+| **Secrets in Terraform** | `opensearch_master_password` marked `sensitive`; `terraform.tfvars` gitignored |
+| **Logging** | Lambda → CloudWatch Logs (AWS-managed) |
 
-### Gaps and risks (address before production)
+### Security Gaps / Risks
 
-| Area | Current state |
-|------|----------------|
-| **IAM least privilege** | Lambda policy uses `Resource = "*"` for SNS and CloudWatch Logs; DynamoDB ARN includes a **hardcoded account ID** (`091855123856`) |
-| **OpenSearch credentials** | Master username/password passed as **plain Lambda environment variables** (visible to anyone with `lambda:GetFunctionConfiguration`) |
-| **OpenSearch access policy** | Contains hardcoded IAM user ARN and **single /32 public IP**; a broad `Principal: *` with IP condition—must be updated for your environment |
-| **S3 rule accuracy** | Alerts on API name only, not verified public exposure |
-| **Secrets management** | No AWS Secrets Manager / SSM Parameter Store integration |
-| **Network isolation** | OpenSearch is not VPC-attached in Terraform |
-| **DLQ / failed invocations** | No dead-letter queue or Lambda failure alarms |
-| **Setup script** | `../setup_opensearch.py` contains hardcoded endpoint and credentials—treat as a one-off bootstrap, not a secure pattern |
-
-Items above belong in hardening work unless noted in [Future Improvements](#future-improvements).
+| Risk | Detail |
+|------|--------|
+| **Hardcoded account ID** | DynamoDB and OpenSearch IAM resources use `091855123856` |
+| **Hardcoded IAM user** | `arn:aws:iam::091855123856:user/siem-project-user` in OpenSearch domain policy |
+| **Hardcoded IP allow list** | `68.35.124.19/32` with `Principal: "*"` in domain policy |
+| **Broad IAM statements** | SNS and CloudWatch Logs use `Resource = "*"` |
+| **Broad OpenSearch domain policy** | `es:*` for Lambda role and IAM user |
+| **No Secrets Manager** | Master password in `terraform.tfvars` only |
+| **No VPC** | OpenSearch not VPC-attached in Terraform |
+| **No DLQ** | Failed Lambda invocations not queued for replay |
+| **FGAC role mapping** | `setup_opensearch.py` maps backend roles manually; not in Terraform |
+| **Bootstrap script secrets** | `../setup_opensearch.py` and `../diag.py` contain hardcoded endpoint and credentials |
+| **Detection false positives** | Especially S3 rule (see Threat Detection Logic) |
+| **No remediation** | Alerts do not trigger containment |
+| **Single role for all detectors** | Compromise of one function path affects shared permissions |
 
 ---
 
 ## Monitoring and Observability
 
-| Mechanism | What you can monitor |
-|-----------|----------------------|
-| **CloudWatch Logs** | Lambda execution logs (automatic log groups per function) |
-| **Lambda metrics** | Invocations, errors, duration, throttles (CloudWatch default) |
-| **SNS** | Email delivery of alert subjects and bodies |
-| **OpenSearch** | Document count and contents in `siem-events` (e.g., `_count`, Discover if enabled) |
-| **DynamoDB** | Item counts per `source_ip` for active brute-force tracking |
+### Available today
 
-**Not in repo:** CloudWatch dashboards, alarms on Lambda errors, SNS delivery failure monitoring, or OpenSearch slow-log/index alarms.
+| Signal | Use |
+|--------|-----|
+| **CloudWatch Logs** | Per-Lambda log streams — debug parsing, skips, OpenSearch HTTP status |
+| **Lambda metrics** | Invocations, Errors, Duration, Throttles (account default) |
+| **SNS** | Email delivery of alert subject/body |
+| **OpenSearch** | `_count`, search API, Dashboards (if enabled manually) on `siem-events` |
+| **DynamoDB** | Inspect `siem-failed-auth` items for active counters |
+
+### Gaps (not in repository)
+
+- CloudWatch **alarms** on Lambda errors or duration
+- **Dashboards** (Terraform or JSON) for detection volume
+- SNS delivery failure monitoring
+- OpenSearch slow logs / cluster health alarms
+- Distributed tracing (X-Ray)
+- Centralized security metrics (Security Hub, custom metrics)
 
 ---
 
@@ -254,58 +372,49 @@ Items above belong in hardening work unless noted in [Future Improvements](#futu
 
 ### Prerequisites
 
-1. **AWS account** with permissions to create Lambda, EventBridge, SNS, DynamoDB, OpenSearch, and IAM resources
-2. **AWS CLI** configured (`aws configure` or equivalent credentials)
-3. **Terraform** ≥ 1.0
-4. **CloudTrail** enabled with **EventBridge integration** (trail must send events to the default event bus)
-5. **SNS email confirmation** — after deploy, confirm the subscription email from AWS
-6. **Python 3** (optional, for parent-repo setup/diagnostic scripts)
+| Requirement | Notes |
+|-------------|-------|
+| AWS account | Permissions for Lambda, EventBridge, SNS, DynamoDB, OpenSearch, IAM |
+| AWS CLI | Configured credentials |
+| Terraform | ≥ 1.0 |
+| CloudTrail | Active trail with **EventBridge** delivery enabled |
+| Email inbox | For SNS subscription confirmation |
+| Python 3 | Optional — parent-repo bootstrap scripts |
 
-### 1. Configure variables
+### Steps
 
-```bash
-cd cloud-siem-pipeline
-cp terraform.tfvars.example terraform.tfvars
-```
+1. **Clone and configure**
 
-Edit `terraform.tfvars` with your alert email and strong OpenSearch master password. Do not commit this file.
+   ```bash
+   cd cloud-siem-pipeline
+   cp terraform.tfvars.example terraform.tfvars
+   ```
 
-### 2. Deploy infrastructure
+   Set `alert_email`, `opensearch_master_user`, and a strong `opensearch_master_password`.
 
-```bash
-terraform init
-terraform plan
-terraform apply
-```
+2. **Deploy**
 
-Note the outputs: `opensearch_endpoint`, `sns_topic_arn`.
+   ```bash
+   terraform init
+   terraform plan
+   terraform apply
+   ```
 
-### 3. Confirm SNS subscription
+3. **Confirm SNS** — Approve the AWS subscription email sent to `alert_email`.
 
-Check the inbox for `alert_email` and confirm the AWS SNS subscription.
+4. **Bootstrap OpenSearch index** (not in Terraform)
 
-### 4. Initialize OpenSearch index (manual)
+   ```bash
+   cd ..
+   # Edit setup_opensearch.py: endpoint, master_auth, account ARNs
+   python setup_opensearch.py
+   ```
 
-Terraform creates the domain but not the `siem-events` index mapping. Use the parent script after updating endpoint and credentials:
+   Creates `siem-events` index mapping and FGAC role mappings for Lambda role and IAM user.
 
-```bash
-cd ..
-# Edit setup_opensearch.py: endpoint, credentials, IAM ARNs for your account
-python setup_opensearch.py
-```
+5. **Verify CloudTrail → EventBridge** — Without this, rules never fire.
 
-Alternatively, create the index via OpenSearch Dashboards or the REST API using the mapping in that script.
-
-### 5. Update hardcoded Terraform values
-
-Before sharing or reusing in another account, update:
-
-- `modules/opensearch/main.tf` — IAM user ARN, IP allow list
-- `modules/lambda/main.tf` — DynamoDB table ARN account ID
-
-### 6. Verify CloudTrail → EventBridge
-
-Ensure your trail is active and EventBridge delivery is enabled. Without this, rules will never invoke Lambdas.
+6. **Parameterize hardcoded values** — Update account ID, IAM user ARN, and IP in `modules/opensearch/main.tf` and `modules/lambda/main.tf` before other accounts.
 
 ---
 
@@ -313,39 +422,41 @@ Ensure your trail is active and EventBridge delivery is enabled. Without this, r
 
 ### Terraform variables (root)
 
-| Name | Required | Default | Purpose |
-|------|----------|---------|---------|
-| `alert_email` | Yes | — | SNS email recipient |
-| `opensearch_master_user` | Yes | — | OpenSearch master user |
-| `opensearch_master_password` | Yes | — | OpenSearch master password |
+| Name | Required | Description |
+|------|----------|-------------|
+| `alert_email` | Yes | SNS email recipient |
+| `opensearch_master_user` | Yes | OpenSearch internal master user |
+| `opensearch_master_password` | Yes | OpenSearch master password |
 
-### Lambda environment variables (set in Terraform)
+### Lambda environment variables
 
-| Function | Variable | Value / notes |
-|----------|----------|----------------|
-| All detectors | `SNS_TOPIC_ARN` | From SNS module |
-| All detectors | `OPENSEARCH_ENDPOINT` | Domain endpoint (no `https://` prefix) |
-| All detectors | `OPENSEARCH_USER` / `OPENSEARCH_PASS` | Master credentials |
+| Function | Variable | Value |
+|----------|----------|-------|
+| All | `SNS_TOPIC_ARN` | From SNS module |
+| All | `OPENSEARCH_ENDPOINT` | Domain endpoint hostname (no scheme) |
 | Failed auth | `DYNAMODB_TABLE` | `siem-failed-auth` |
 | Failed auth | `FAILURE_THRESHOLD` | `5` |
 | Failed auth | `WINDOW_SECONDS` | `600` |
 
-### Region
+### Region and endpoints
 
-Provider region is fixed to **`us-east-1`** in `main.tf`. Change the provider and any hardcoded ARNs if deploying elsewhere.
+- **AWS region:** `us-east-1` (`main.tf` provider)
+- **OpenSearch index:** `siem-events`
+- **OpenSearch URL pattern:** `https://{OPENSEARCH_ENDPOINT}/siem-events/_doc`
 
 ---
 
 ## Testing
 
-There is **no automated test suite** (no `tests/` directory, pytest, or CI).
+### Automated tests
 
-### Manual Lambda invoke (brute force)
+**Not implemented** — No `tests/` directory, pytest, or CI test jobs in this repository.
 
-Use `payload.json` or inline JSON matching EventBridge’s CloudTrail `detail` shape:
+### Manual testing — brute force
+
+`payload.json` (gitignored) provides a sample failed-auth event:
 
 ```bash
-# Invoke once — expect status "recorded" until threshold
 aws lambda invoke \
   --function-name siem-failed-auth-detector \
   --payload file://payload.json \
@@ -354,33 +465,31 @@ aws lambda invoke \
 cat response.json
 ```
 
-Simulate threshold breach (5 invocations with same `sourceIPAddress`):
+Trigger threshold (5 invocations, same IP):
 
 ```bash
 for i in 1 2 3 4 5; do
   aws lambda invoke \
     --function-name siem-failed-auth-detector \
-    --payload '{"detail":{"errorMessage":"Failed authentication","sourceIPAddress":"10.0.0.99","eventTime":"2026-05-23T10:00:00Z","userIdentity":{"arn":"arn:aws:iam::ACCOUNT_ID:user/test-attacker"}}}' \
+    --payload '{"detail":{"errorMessage":"Failed authentication","sourceIPAddress":"10.0.0.99","eventTime":"2026-05-23T10:00:00Z","userIdentity":{"arn":"arn:aws:iam::YOUR_ACCOUNT_ID:user/test-attacker"}}}' \
     response.json
   cat response.json
 done
 ```
 
-Replace `ACCOUNT_ID` with your AWS account ID. On the fifth call, expect `"status": "alert_sent"` and an SNS email.
-
-> **CLI note:** Older AWS CLI v1 may not support `--cli-binary-format raw-in-base64-out`; use `file://payload.json` or upgrade to AWS CLI v2.
+Expect `"status": "alert_sent"` on the fifth invocation and an SNS email.
 
 ### Other detectors
 
-- **Root:** Invoke `siem-root-usage-detector` with a synthetic event where `detail.userIdentity.type` is `Root`.
-- **S3:** Invoke `siem-s3-exposure-detector` with `detail.eventName` set to `PutBucketPolicy` and appropriate `requestParameters.bucketName`.
+- **Root:** Invoke `siem-root-usage-detector` with `detail.userIdentity.type` = `"Root"`.
+- **S3:** Invoke `siem-s3-exposure-detector` with `detail.eventName` = `"PutBucketPolicy"` and `requestParameters.bucketName`.
 
-### Suggested future testing
+### Recommended future testing
 
-- Unit tests for handler parsing and threshold logic
-- Terraform `validate` / `plan` in CI
-- EventBridge sample events from AWS documentation as fixtures
-- Integration tests in a disposable AWS account
+- Unit tests for threshold logic and skip paths
+- Terraform `validate` / `fmt` in CI
+- EventBridge sample event fixtures
+- Integration tests in a sandbox account
 
 ---
 
@@ -388,54 +497,89 @@ Replace `ACCOUNT_ID` with your AWS account ID. On the fifth call, expect `"statu
 
 ![Example Alert](docs/images/example-alert.png)
 
-![Dashboard Screenshot](docs/images/example-dashboard.png)
+TODO: Replace with actual screenshot.
+
+![Dashboard Screenshot](docs/images/dashboard-screenshot.png)
+
+TODO: Replace with actual screenshot.
+
+> **Note:** OpenSearch Dashboards are not defined in IaC. A dashboard screenshot requires manual Dashboards setup.
 
 ---
 
 ## Challenges and Lessons Learned
 
-- **CloudTrail is the real source of truth** — EventBridge rules are useless without a correctly configured trail and EventBridge integration; this coupling is easy to overlook in IaC-only repos.
-- **False positives vs. speed** — The S3 detector favors fast notification over accuracy; production SIEMs usually add policy parsing or post-event verification.
-- **Stateful detection in serverless** — Brute-force counting with DynamoDB and TTL is simple and cost-effective but is per-account and per-IP only (no username dimension in the key).
-- **Credential handling** — Passing OpenSearch master credentials into Lambda environment variables is convenient for an MVP but conflicts with least-privilege and rotation practices; IAM signing or data-plane roles are the usual upgrade path.
-- **Module interdependencies** — OpenSearch needs the Lambda role ARN while Lambda needs the endpoint; plan applies carefully and document bootstrap order for teammates.
-- **Alert noise** — Root and S3 rules alert on first match; failed auth waits for a threshold—tune thresholds and consider suppression windows as traffic grows.
-- **Hardcoded account artifacts** — ARNs and IP allow lists in Terraform reduce portability; parameterize early when moving accounts.
+- **EventBridge dependency** — The pipeline is invisible without CloudTrail → EventBridge; documenting and automating that prerequisite is as important as the Lambda code.
+- **Terraform module cycle** — OpenSearch needs the Lambda role ARN while Lambda needs the endpoint; teams should understand apply order and partial updates.
+- **Detection tuning vs. alert fatigue** — Immediate S3 alerts teach the cost of naive rules; thresholds and content inspection matter.
+- **IAM evolution** — Moving from basic auth in Lambda env to SigV4 improved credential hygiene; FGAC role mapping remains a manual bootstrap step.
+- **Portability** — Hardcoded account IDs, IAM users, and IPs block clean reuse across accounts until parameterized.
+- **Investigation gap** — Email alerts without dashboards or runbooks leave analysts dependent on OpenSearch API knowledge.
+
+---
+
+## Operational Limitations
+
+| Limitation | Status |
+|------------|--------|
+| Single AWS account only | Not implemented: org-wide or multi-account aggregation |
+| Three detection rules | No generic rule engine or Sigma support |
+| No SOAR / auto-remediation | Alerts only |
+| No long-term log archive | CloudTrail S3 archival not managed here |
+| No correlation engine | Each event evaluated independently |
+| No built-in dashboards | Dashboards not in repo |
+| Email-only alerting | No Slack/PagerDuty/Ticket integration |
+| S3 detection accuracy | Does not confirm public access |
+| No high availability | Single-node OpenSearch |
+| No formal SLOs / on-call runbooks | Not in repository |
 
 ---
 
 ## Cost Considerations
 
-| Service | Cost driver |
-|---------|-------------|
-| **OpenSearch** | Largest steady-state cost: `t3.small.search` instance + 10 GB EBS (24/7) |
-| **Lambda** | Per-invocation; low at moderate EventBridge volume |
-| **DynamoDB** | On-demand pricing; small items with TTL expiry |
-| **SNS** | Email notifications (low volume) |
-| **EventBridge** | Custom events / invocations (typically low for security rules) |
-| **CloudTrail** | Management events (first trail often free tier; data events extra) |
+| Service | Cost profile |
+|---------|----------------|
+| **OpenSearch** | Primary **steady-state** cost: `t3.small.search` + 10 GB gp3 EBS, 24/7 |
+| **Lambda** | Per-invocation; driven by CloudTrail/EventBridge volume |
+| **DynamoDB** | On-demand, small items, TTL expiry |
+| **SNS** | Low for email at alert volumes typical of this MVP |
+| **EventBridge** | Usually low for custom rules at moderate volume |
+| **CloudTrail** | Management events (account-dependent; data events extra) |
 
-**Serverless benefits:** Lambda and DynamoDB scale to zero idle cost for compute; OpenSearch does not.
+**Serverless benefit:** Lambda and DynamoDB have no idle compute charge; OpenSearch does not.
 
-**Optimization ideas (not implemented):** OpenSearch UltraWarm/cold storage, smaller instance for dev, index lifecycle policies, shorten CloudTrail retention if duplicated elsewhere, replace email with cheaper channels for high-volume tests.
+**Optimization opportunities (not implemented):** Smaller dev domain, index lifecycle management, UltraWarm, reduce failed-auth invocations via tighter EventBridge patterns, CloudTrail trail scope review.
+
+---
+
+## Potential Production Enhancements
+
+- Amazon **GuardDuty** / **Security Hub** finding ingestion
+- **Kinesis Data Firehose** or **OpenSearch Ingestion** for bulk log pipelines
+- **SOAR** playbooks (Lambda → SSM, WAF IP sets, Security Group deny)
+- **ML anomaly detection** on API volume baselines
+- **Threat intelligence** IP/domain enrichment
+- **Sigma** or OCSF-normalized rules
+- **CI/CD** with `terraform plan` on PRs and security scanning
+- **Cross-account** CloudTrail organization trail + centralized EventBridge
+- **RBAC dashboards** in OpenSearch Dashboards
+- **VPC** deployment for OpenSearch with private endpoints
 
 ---
 
 ## Future Improvements
 
-- [ ] **Multi-account / Organizations** — centralized logging account, delegated EventBridge
-- [ ] **CloudTrail as code** — Terraform module for trail, S3 bucket, and EventBridge enablement
-- [ ] **Sigma / structured rule engine** — portable detection content
-- [ ] **Threat intelligence** — IP/domain reputation enrichment on alerts
-- [ ] **Anomaly detection** — baselines for API volume and geo
-- [ ] **SOAR / remediation** — WAF IP block, Security Group deny, SSM automation
-- [ ] **OpenSearch Dashboards** — saved searches and detection overview (IaC or export)
-- [ ] **CI/CD** — `terraform fmt/validate/plan`, Python lint/test on pull requests
-- [ ] **Test coverage** — unit and integration tests for all three handlers
-- [ ] **Security hardening** — Secrets Manager, VPC OpenSearch, least-privilege IAM, DLQ, Lambda error alarms
-- [ ] **S3 detection accuracy** — evaluate policy/ACL for public access before alerting
-- [ ] **Parameterize** — remove hardcoded account ID, IAM user, and IP from OpenSearch policy
-- [ ] **License file** — add explicit open-source license
+- [ ] Terraform module for **CloudTrail + EventBridge** enablement
+- [ ] Remove **unused** `opensearch_user` / `opensearch_pass` Lambda module variables
+- [ ] **Parameterize** account ID, IAM ARNs, IP allow lists
+- [ ] **Secrets Manager** for OpenSearch master password
+- [ ] **DLQ** + CloudWatch alarms on Lambda errors
+- [ ] **S3 policy analysis** before alert
+- [ ] **Unit/integration tests** and CI pipeline
+- [ ] **Remote Terraform state** (S3 + DynamoDB lock)
+- [ ] Sanitize **`setup_opensearch.py`** / **`diag.py`** (no hardcoded secrets)
+- [ ] **LICENSE** file
+- [ ] OpenSearch index creation via Terraform or `opensearch` provider
 
 ---
 
@@ -447,20 +591,66 @@ License to be added.
 
 ## Author
 
-<!-- TODO: Replace placeholders with your links -->
-
 | | |
 |---|---|
-| **GitHub** | [@Dfortune014](https://github.com/Dfortune014) |
-| **LinkedIn** | [Fortune Linus](https://www.linkedin.com/in/fortunelinus/) |
-| **Portfolio** | [fortunelinus.com](https://your-portfolio.example) |
+| **GitHub** | [@your-username](https://github.com/your-username) |
+| **LinkedIn** | [Your Name](https://www.linkedin.com/in/your-profile/) |
+| **Portfolio** | [https://your-portfolio.example](https://your-portfolio.example) |
 
 ---
 
-## Post-README checklist (for maintainers)
+## Post-README Checklist
 
-1. Add `docs/images/architecture-diagram.png` and screenshot placeholders.
-2. Replace hardcoded ARNs/IPs in `modules/opensearch/main.tf` and `modules/lambda/main.tf`.
-3. Parameterize or remove credentials from `../setup_opensearch.py`.
-4. Confirm CloudTrail → EventBridge in the target account.
-5. Add a `LICENSE` file when ready.
+- [ ] Add or finalize `docs/images/architecture-diagram.png`
+- [ ] Add `docs/images/example-alert.png` and `docs/images/dashboard-screenshot.png`
+- [ ] Replace author/contact placeholders
+- [ ] Add `LICENSE` file
+- [ ] Remove hardcoded account `091855123856`, IAM user, and IP from Terraform
+- [ ] Confirm **CloudTrail → EventBridge** in target account
+- [ ] Run `setup_opensearch.py` after deploy (update credentials/endpoint)
+- [ ] Remove secrets from `setup_opensearch.py` and `diag.py` or move to env vars
+- [ ] Confirm SNS email subscription
+- [ ] Tune `FAILURE_THRESHOLD` / `WINDOW_SECONDS` for your environment
+- [ ] Consider remote Terraform state for team use
+
+---
+
+## Documentation Summary (for maintainers)
+
+### 1. What was documented
+
+All 29 README sections: project context, detection coverage table, architecture, security decisions, processing flow, per-detector logic, scalability, tech stack, repo structure, Terraform/IaC, security controls and gaps, observability, deployment, configuration, testing, screenshots, lessons learned, operational limits, cost, production enhancements, future work, license, author, and maintainer checklist.
+
+### 2. Assumptions made
+
+- CloudTrail with EventBridge integration exists outside this repo.
+- OpenSearch index `siem-events` is created via parent `setup_opensearch.py`.
+- Region is `us-east-1`.
+- `docs/images/*` may exist locally but are not required in git for the pipeline to run.
+
+### 3. Missing implementations discovered
+
+- No CloudTrail/EventBridge Terraform
+- No automated tests or CI
+- No DLQ, alarms, or dashboards as code
+- No OpenSearch index in Terraform
+- Unused Lambda module variables (`opensearch_user`, `opensearch_pass`)
+- S3 detector does not validate public exposure
+- No multi-account, SOAR, or threat intel
+
+### 4. Recommended next engineering improvements
+
+1. Parameterize hardcoded ARNs/IPs and add CloudTrail module.
+2. Add DLQ + CloudWatch alarms; remove dead Terraform variables.
+3. Implement S3 policy inspection or downgrade alert severity until accurate.
+4. Add pytest for handlers and `terraform validate` in CI.
+5. Move OpenSearch bootstrap into IaC or a secured one-shot job (no secrets in git).
+
+### 5. Security concerns discovered
+
+- Hardcoded credentials in `setup_opensearch.py` and `diag.py` (parent repo).
+- Broad IAM (`Resource = "*"`) for SNS and logs.
+- OpenSearch domain policy with `Principal: *` + IP condition and hardcoded IAM user.
+- High false-positive rate on S3 rule.
+- Shared Lambda role across all detectors.
+- Local Terraform state may contain sensitive values if committed (mitigated by `.gitignore`).
