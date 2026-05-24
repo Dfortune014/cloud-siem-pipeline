@@ -1,0 +1,23 @@
+# Terraform state - contains sensitive data
+*.tfstate
+*.tfstate.backup
+.terraform/
+*.tfplan
+
+# Lambda zip files - generated at build time
+*.zip
+
+# Environment files - contains secrets
+.env
+*.env
+terraform.tfvars
+
+# Python
+__pycache__/
+*.pyc
+venv/
+
+# AWS credentials
+.aws/
+payload.json
+response.json

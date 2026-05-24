@@ -1,0 +1,3 @@
+alert_email                = "your-email@gmail.com"
+opensearch_master_user     = "siemadmin"
+opensearch_master_password = "YourStrongPassword123!"
