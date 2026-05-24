@@ -451,9 +451,9 @@ License to be added.
 
 | | |
 |---|---|
-| **GitHub** | [@your-username](https://github.com/Dfortune014) |
-| **LinkedIn** | [Your Name](https://www.linkedin.com/in/fortunelinus/) |
-| **Portfolio** | [https://your-portfolio.example](https://your-portfolio.example) |
+| **GitHub** | [@Dfortune014](https://github.com/Dfortune014) |
+| **LinkedIn** | [Fortune Linus](https://www.linkedin.com/in/fortunelinus/) |
+| **Portfolio** | [fortunelinus.com](https://your-portfolio.example) |
 
 ---
 
